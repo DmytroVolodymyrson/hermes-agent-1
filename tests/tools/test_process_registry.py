@@ -384,13 +384,17 @@ def test_reader_loop_still_replaces_genuinely_invalid_bytes(registry, monkeypatc
     assert session.output_buffer == "ok\ufffddone\n"
 
 
-def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry, monkeypatch):
-    """The PTY reader gets the same incremental-decode treatment."""
+@pytest.mark.parametrize("exitstatus,signalstatus,expected_code", [(0, None, 0), (None, 9, -9)])
+def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(
+    registry, monkeypatch, exitstatus, signalstatus, expected_code,
+):
+    """The PTY reader preserves UTF-8 and finalizes both ordinary and signal exits."""
 
     class _FakePty:
         def __init__(self, chunks):
             self._chunks = list(chunks)
-            self.exitstatus = 0
+            self.exitstatus = exitstatus
+            self.signalstatus = signalstatus
 
         def isalive(self):
             return bool(self._chunks)
@@ -405,14 +409,21 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
     session = _make_session(sid="proc_pty_utf8")
     session._pty = _FakePty([b"caf\xc3", b"\xa9\n"])
+    session.notify_on_complete = True
+    registry._running[session.id] = session
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
 
     registry._pty_reader_loop(session)
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer
+    assert session.exited and session.exit_code == expected_code
+    assert session._completion_event.is_set()
+    assert not registry.is_session_waiting(session.id)
+    assert registry.completion_queue.get_nowait()["exit_code"] == expected_code
+    assert registry.completion_queue.empty()
 
 
 # =========================================================================
@@ -701,6 +712,64 @@ class TestPruning:
 
         total = len(registry._running) + len(registry._finished)
         assert total <= MAX_PROCESSES
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec redirects the capture pipe")
+def test_capture_eof_waits_for_real_exit_and_notifies_without_polling(registry, tmp_path, monkeypatch):
+    """Closing capture is not completion; the reader must observe the eventual exit."""
+    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", tmp_path / "processes.json")
+    release = tmp_path / "release"
+    child = (
+        "import pathlib,time; "
+        "release=pathlib.Path('release'); deadline=time.monotonic()+20; "
+        "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.02)"
+        "\nraise SystemExit(7 if release.exists() else 97)"
+    )
+    session = registry.spawn_local(
+        f"exec {shlex.quote(sys.executable)} -c {shlex.quote(child)} >worker.out 2>worker.err",
+        cwd=str(tmp_path), use_pty=False,
+    )
+    session.notify_on_complete = True
+    try:
+        # Wait longer than the old five-second reader timeout. No registry
+        # poll()/wait() is allowed to repair state or trigger the notification.
+        assert not session._completion_event.wait(5.3)
+        assert not session.exited
+        assert registry.is_session_waiting(session.id)
+        assert registry.completion_queue.empty()
+        assert session._reader_thread is not None and session._reader_thread.is_alive()
+        release.touch()
+        notification = registry.completion_queue.get(timeout=5)
+        assert notification["session_id"] == session.id
+        assert notification["exit_code"] == 7
+        assert session.exited and session.exit_code == 7
+        assert not registry.is_session_waiting(session.id)
+        session._reader_thread.join(timeout=5)
+        assert not session._reader_thread.is_alive()
+        assert registry.completion_queue.empty()
+    finally:
+        release.touch()
+        if session.process is not None:
+            session.process.wait(timeout=5)
+        if session._reader_thread is not None:
+            session._reader_thread.join(timeout=5)
+
+
+def test_reader_wait_failure_does_not_report_unknown_exit(registry):
+    """An exceptional wait is not evidence that the child exited."""
+    import codecs
+
+    session = _make_session()
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    wait = MagicMock(side_effect=OSError("wait failed"))
+    registry._finish_reader(
+        session, codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        lambda text: None, "Process", wait, lambda: None,
+    )
+    assert not session.exited
+    assert not session._completion_event.is_set()
+    assert registry.completion_queue.empty()
 
 
 # =========================================================================

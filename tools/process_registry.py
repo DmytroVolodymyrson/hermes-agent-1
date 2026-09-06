@@ -1025,9 +1025,11 @@ class ProcessRegistry:
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
+            # Capture can close before the child exits (e.g. shell redirection).
+            # This existing reader thread owns the real exit, just like the PTY reader.
             self._finish_reader(
                 session, decoder, _append_chunk, "Process",
-                lambda: session.process.wait(timeout=5), lambda: session.process.returncode)
+                lambda: session.process.wait(), lambda: session.process.returncode)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
@@ -1040,7 +1042,9 @@ class ProcessRegistry:
             wait()
         except Exception as e:
             logger.debug("%s wait timed out or failed: %s", label, e)
-        self._finish_exited(session, exit_code())
+        code = exit_code()
+        if code is not None:
+            self._finish_exited(session, code)
 
     @staticmethod
     def _log_delta_command(quoted_log_path: str, offset: int) -> str:
@@ -1153,7 +1157,8 @@ class ProcessRegistry:
             logger.debug("PTY stdout reader ended: %s", e)
         self._finish_reader(
             session, decoder, lambda t: self._ingest_output(session, t), "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+            pty.wait, lambda: -pty.signalstatus if getattr(pty, 'signalstatus', None) is not None
+            else getattr(pty, 'exitstatus', -1))
 
     def _ingest_output(self, session: ProcessSession, text: str) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live."""
