@@ -234,6 +234,15 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         pid_int, window_id_int = _positive_int(w.get("pid")), _positive_int(w.get("window_id"))
         if pid_int is None or window_id_int is None:
             continue
+        # Chromium exposes 1x1 helper surfaces above its real windows, including
+        # on other Spaces. They yield empty captures and must not win discovery.
+        bounds = w.get("bounds")
+        if isinstance(bounds, dict) and any(
+            isinstance(size := bounds.get(axis), (int, float))
+            and not isinstance(size, bool) and 0 <= size <= 1
+            for axis in ("width", "height")
+        ):
+            continue
         z_raw, app_name, title = w.get("z_index"), w.get("app_name", ""), w.get("title", "")
         windows.append({
             "app_name": app_name if isinstance(app_name, str) else "",
